@@ -3,10 +3,11 @@ import re
 import sphinxify
 import typing
 
-from .config.autowrap_yml import (
+from ..config.autowrap_yml import (
     AutowrapConfigYaml,
     BufferType,
     ClassData,
+    EnumData,
     EnumValue,
     FunctionData,
     PropData,
@@ -15,6 +16,14 @@ from .config.autowrap_yml import (
 )
 from .generator_data import GeneratorData, MissingReporter
 from .mangle import trampoline_signature
+
+from .j2_context import (
+    ClassContext,
+    EnumContext,
+    EnumeratorContext,
+    HeaderContext,
+    TemplateInstanceContext,
+)
 
 
 # TODO: this isn't the best solution
@@ -79,9 +88,8 @@ class Hooks:
         self.has_operators = False
 
         self.types: typing.Set[str] = set()
-        self.class_hierarchy: typing.Dict[str, typing.List[str]] = {}
 
-        self.subpackages: typing.Dict[str, str] = {}
+        self.hctx = HeaderContext()
 
     def report_missing(self, name: str, reporter: MissingReporter):
         self.gendata.report_missing(name, reporter)
@@ -90,13 +98,13 @@ class Hooks:
         # defer until the end since there's lots of duplication
         self.types.add(typename)
 
-    def _add_subpackage(self, v, data):
+    def _get_module_var(self, v, data):
         if data.subpackage:
             var = "pkg_" + data.subpackage.replace(".", "_")
-            self.subpackages[data.subpackage] = var
-            v["x_module_var"] = var
-        else:
-            v["x_module_var"] = "m"
+            self.hctx.subpackages[data.subpackage] = var
+            return var
+
+        return "m"
 
     def _get_type_caster_includes(self):
         seps = re.compile(r"[<>\(\)]")
@@ -117,7 +125,7 @@ class Hooks:
                         includes.add(header)
         return sorted(includes)
 
-    def _set_name(self, name, data, strip_prefixes=None, is_operator=False):
+    def _make_py_name(self, name, data, strip_prefixes=None, is_operator=False):
         if data.rename:
             return data.rename
 
@@ -203,44 +211,66 @@ class Hooks:
 
         return param_sig
 
-    def _enum_hook(self, en, enum_data):
-        ename = en.get("name")
+    def _enum_hook(
+        self, cpp_scope: str, scope_var: str, var_name: str, en, enum_data: EnumData
+    ) -> EnumContext:
+
         value_prefix = None
+        strip_prefixes = []
+        values: typing.List[EnumeratorContext] = []
+
+        py_name = ""
+        full_cpp_name = ""
+
+        ename = en.get("name", "")
+
         if ename:
+            full_cpp_name = f"{cpp_scope}{ename}"
+            py_name = self._make_py_name(ename, enum_data)
+
             value_prefix = enum_data.value_prefix
             if not value_prefix:
                 value_prefix = ename
 
-            en["x_name"] = self._set_name(ename, enum_data)
-
-        en["x_doc_quoted"] = self._process_doc(en, enum_data)
-
-        if value_prefix:
-            strip_prefixes = [value_prefix + "_", value_prefix]
-        else:
-            strip_prefixes = []
+            strip_prefixes = [f"{value_prefix}_", value_prefix]
 
         for v in en["values"]:
             name = v["name"]
             v_data = enum_data.values.get(name)
             if v_data is None:
                 v_data = EnumValue()
-            v["x_name"] = self._set_name(name, v_data, strip_prefixes)
-            v["data"] = v_data
-            v["x_doc_quoted"] = self._process_doc(v, v_data, append_prefix="  ")
+
+            values.append(
+                EnumeratorContext(
+                    cpp_name=f"{full_cpp_name}::{name}",
+                    py_name=self._make_py_name(name, v_data, strip_prefixes),
+                    doc=self._process_doc(v, v_data, append_prefix="  "),
+                )
+            )
+
+        return EnumContext(
+            scope_var=scope_var,
+            var_name=var_name,
+            full_cpp_name=full_cpp_name,
+            py_name=py_name,
+            values=values,
+            doc=self._process_doc(en, enum_data),
+        )
 
     def header_hook(self, header, data):
         """Called for each header"""
-        data["trampoline_signature"] = trampoline_signature
-        data["using_signature"] = _using_signature
 
-        for en in header.enums:
-            en["x_namespace"] = en["namespace"]
+        self.hctx.rel_fname = header["rel_fname"]
+
+        for i, en in enumerate(header.enums):
             enum_data = self.gendata.get_enum_data(en.get("name"))
-            en["data"] = enum_data
 
-            self._add_subpackage(en, enum_data)
-            self._enum_hook(en, enum_data)
+            if not enum_data.ignore:
+                scope_var = self._get_module_var(en, enum_data)
+                var_name = f"enum{i}"
+                self.hctx.enums.append(
+                    self._enum_hook(en["namespace"], scope_var, var_name, en, enum_data)
+                )
 
         for v in header.variables:
             var_data = self.gendata.get_prop_data(v["name"])
@@ -250,37 +280,49 @@ class Hooks:
         for _, u in header.using.items():
             self._add_type_caster(u["raw_type"])
 
-        data["class_hierarchy"] = self.class_hierarchy
-        data["subpackages"] = self.subpackages
         data["x_has_operators"] = self.has_operators
 
-        templates = {}
-        for k, tmpl_data in data["data"].templates.items():
+        data["trampoline_signature"] = trampoline_signature
+        data["using_signature"] = _using_signature
+
+        for i, (k, tmpl_data) in enumerate(data["data"].templates.items()):
             qualname = tmpl_data.qualname
             if "::" not in qualname:
                 qualname = f"::{qualname}"
-            tmpl_data_d = tmpl_data.dict()
-            tmpl_data_d["x_qualname_"] = qualname.translate(self._qualname_trans)
-            tmpl_data_d["x_doc_set"] = self._quote_doc(tmpl_data.doc)
+            qualname = qualname.translate(self._qualname_trans)
+
             doc_add = tmpl_data.doc_append
             if doc_add:
                 doc_add = f"\n{doc_add}"
-            tmpl_data_d["x_doc_add"] = self._quote_doc(doc_add)
-            self._add_subpackage(tmpl_data_d, tmpl_data)
-            templates[k] = tmpl_data_d
+
+            self.hctx.template_instances.append(
+                TemplateInstanceContext(
+                    scope_var=self._get_module_var(tmpl_data.dict(), tmpl_data),
+                    var_name=f"tmplCls{i}",
+                    py_name=k,
+                    binding_object=f"rpygen::bind_{qualname}",
+                    type_params=tmpl_data.params,
+                    header_name=f"{qualname}.hpp",
+                    doc_set=self._quote_doc(tmpl_data.doc),
+                    doc_add=self._quote_doc(doc_add),
+                )
+            )
 
             for param in tmpl_data.params:
                 self._add_type_caster(param)
 
-        data["templates"] = templates
+        self.hctx.type_caster_includes = self._get_type_caster_includes()
 
-        data["type_caster_includes"] = self._get_type_caster_includes()
+        # TODO: final step, clear data, and only keep
+        #       our header item instead
 
     def _function_hook(self, fn, data: FunctionData, internal: bool = False):
         """shared with methods/functions"""
 
         # Python exposed function name converted to camelcase
-        x_name = self._set_name(fn["name"], data, is_operator=fn.get("operator", False))
+        x_name = self._make_py_name(
+            fn["name"], data, is_operator=fn.get("operator", False)
+        )
         if not data.rename and not x_name[:2].isupper():
             x_name = x_name[0].lower() + x_name[1:]
 
@@ -542,7 +584,7 @@ class Hooks:
             fn["data"] = data
             return
 
-        self._add_subpackage(fn, data)
+        self._get_module_var(fn, data)
         self._function_hook(fn, data)
 
     def class_hook(self, cls, data):
@@ -550,6 +592,8 @@ class Hooks:
         if cls["parent"] is not None and cls["access_in_parent"] == "private":
             cls["data"] = ClassData(ignore=True)
             return
+
+        ctx = ClassContext()
 
         cls_name = cls["name"]
         cls_key = cls_name
@@ -570,17 +614,18 @@ class Hooks:
         for typename in class_data.force_type_casters:
             self._add_type_caster(typename)
 
-        self._add_subpackage(cls, class_data)
+        self._get_module_var(cls, class_data)
 
         # fix enum paths
-        for e in cls["enums"]["public"]:
-            e["x_namespace"] = e["namespace"] + "::" + cls_name + "::"
+        for i, e in enumerate(cls["enums"]["public"]):
             enum_data = self.gendata.get_cls_enum_data(
                 e.get("name"), cls_key, class_data
             )
-            e["data"] = enum_data
-
-            self._enum_hook(e, enum_data)
+            if not enum_data.ignore:
+                scope = f"{e['namespace']}::{cls_name}::"
+                scope_var = f"{ctx.var_name}"
+                var_name = f"{ctx.var_name}_enum{i}"
+                self._enum_hook(scope, scope_var, var_name, e, enum_data)
 
         # update inheritance
 
@@ -633,7 +678,7 @@ class Hooks:
             cls_qualname = simple_cls_qualname
 
         cls["x_qualname_"] = cls_qualname.translate(self._qualname_trans)
-        self.class_hierarchy[simple_cls_qualname] = [
+        self.hctx.class_hierarchy[simple_cls_qualname] = [
             base["x_qualname"] for base in cls["x_inherits"]
         ] + class_data.force_depends
 
@@ -812,5 +857,5 @@ class Hooks:
 
         cls["x_has_constructor"] = has_constructor
         cls["x_varname"] = "cls_" + cls_name
-        cls["x_name"] = self._set_name(cls_name, class_data)
+        cls["x_name"] = self._make_py_name(cls_name, class_data)
         cls["x_doc_quoted"] = self._process_doc(cls, class_data)

@@ -31,8 +31,8 @@ from setuptools import Extension
 
 from .download import download_and_extract_zip
 
-from .generator_data import MissingReporter
-from .hooks import Hooks
+from .autowrap.generator_data import MissingReporter
+from .autowrap.hooks import Hooks
 
 from .config.autowrap_yml import AutowrapConfigYaml
 from .config.dev_yml import get_dev_config

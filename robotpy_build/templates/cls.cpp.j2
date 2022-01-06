@@ -27,8 +27,8 @@ using {{ using.raw_type }};
 #include <rpygen/{{ cls.x_qualname_ }}.hpp>
 {% endfor %}
 
-{% for tmpl_data in templates.values() %}
-#include <rpygen/{{ tmpl_data.x_qualname_ }}.hpp>
+{% for t in header.template_instances %}
+#include <rpygen/{{ t.header_name }}>
 {% endfor %}
 
 {% for inc in data.extra_includes %}
@@ -40,7 +40,7 @@ using {{ using.raw_type }};
 
   - namespace/typealiases
   - global enums
-  - templates (because CRTP)
+  - template instances (because CRTP)
   - class declarations
   - class enums
   - class methods
@@ -75,8 +75,8 @@ struct rpybuild_{{ mod_fn }}_initializer {
 {% endfor %}
 
 {# template decls #}
-{% for name, tmpl_data in templates.items() %}
-  rpygen::bind_{{ tmpl_data.x_qualname_ }}<{{ tmpl_data.params | join(', ') }}> tmplCls{{ loop.index }};
+{% for t in template_instances %}
+  {{ t.binding_object }}<{{ t.type_params | join(', ') }}> {{ t.var_name }};
 {% endfor %}
 
 {# class decls #}
@@ -98,8 +98,8 @@ struct rpybuild_{{ mod_fn }}_initializer {
     enum{{ loop.index }}{{ pybind11.enum_init(enum.x_module_var, enum) }},
   {% endfor %}
 
-  {% for name, tmpl_data in templates.items() %}
-    tmplCls{{ loop.index }}({{ tmpl_data.x_module_var }}, "{{ name }}"),
+  {% for t in header.template_instances %}
+    {{ t.var_name }}({{ t.scope_var }}, "{{ t.py_name }}"),
   {% endfor %}
 
   {% for cls in header.classes
@@ -118,8 +118,8 @@ void finish() {
 {% endfor %}
 
 {# templates #}
-{% for tdata in templates.values() %}
-  tmplCls{{ loop.index }}.finish(
+{% for t in header.template_instances %}
+  {{ t.var_name }}.finish(
     {% if tdata.x_doc_set %}{{ pybind11.docv(tdata.x_doc_set) }}{% else %}NULL{% endif %},
     {% if tdata.x_doc_add %}{{ pybind11.docv(tdata.x_doc_add) }}{% else %}NULL{% endif %}
   );
