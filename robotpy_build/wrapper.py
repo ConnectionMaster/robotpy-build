@@ -14,26 +14,42 @@ from os.path import (
     sep,
     splitext,
 )
+import pathlib
 import posixpath
 import shutil
+import sysconfig
 import toposort
-from typing import Any, Dict, List, Optional, Set
-import yaml
-
-from header2whatever.config import Config
-from header2whatever.parse import ConfigProcessor
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from urllib.error import HTTPError
 import dataclasses
 
 from setuptools import Extension
 
-from .devcfg import get_dev_config
+from cxxheaderparser.options import ParserOptions
+from cxxheaderparser import preprocessor
+
+
 from .download import download_and_extract_zip
-from .pyproject_configs import PatchInfo, WrapperConfig, Download
-from .generator_data import MissingReporter
-from .hooks import Hooks
-from .hooks_datacfg import HooksDataYaml
+from .config.pyproject_toml import PatchInfo, WrapperConfig, Download
+
+from .autowrap.cxxparser import parse_header
+from .autowrap.generator_data import GeneratorData, MissingReporter
+from .autowrap.writer import WrapperWriter
+
+from .config.autowrap_yml import AutowrapConfigYaml
+from .config.dev_yml import get_dev_config
+from .config.pyproject_toml import WrapperConfig, Download
+
+# TODO: eventually provide native preprocessor by default and allow it
+#       to be enabled/disabled per-file just in case
+if os.getenv("RPYBUILD_PP_GCC") == "1":
+    # GCC preprocessor can be 10x faster than pcpp for very complex files
+    def make_preprocessor(*args, **kwargs):
+        return preprocessor.make_gcc_preprocessor(print_cmd=False, *args, **kwargs)
+
+else:
+    make_preprocessor = preprocessor.make_pcpp_preprocessor
 
 
 class Wrapper:
@@ -45,10 +61,10 @@ class Wrapper:
     # -> should we change this based on what flags the compiler supports?
     _cpp_version = "__cplusplus 201703L"
 
-    def __init__(self, package_name, cfg: WrapperConfig, setup):
-
+    def __init__(self, package_name, cfg: WrapperConfig, setup, wwriter: WrapperWriter):
         self.package_name = package_name
         self.cfg = cfg
+        self.wwriter = wwriter
 
         self.setup_root = setup.root
         self.pypi_package = setup.pypi_package
@@ -84,7 +100,7 @@ class Wrapper:
         self.depends = self.cfg.depends
 
         # Files that are generated AND need to be in the final wheel. Used by build_py
-        self.generated_files: List[str] = []
+        self.additional_data_files: List[str] = []
 
         self._all_deps = None
 
@@ -131,6 +147,8 @@ class Wrapper:
 
         self.dev_config = get_dev_config(self.name)
 
+        self._update_addl_data_files()
+
     def _extract_zip_to(self, dl: Download, dst, cache):
         try:
             download_and_extract_zip(dl.url, dst, cache)
@@ -174,12 +192,12 @@ class Wrapper:
                     raise OSError(err_msg)
                 raise e
 
-    def _add_generated_file(self, fullpath):
+    def _add_addl_data_file(self, fullpath):
         if not isdir(fullpath):
-            self.generated_files.append(relpath(fullpath, self.root))
+            self.additional_data_files.append(relpath(fullpath, self.root))
 
     # pkgcfg interface
-    def get_include_dirs(self) -> Optional[List[str]]:
+    def get_include_dirs(self) -> List[str]:
         includes = [self.incdir, self.rpy_incdir]
         if self.cfg.download:
             for dl in self.cfg.download:
@@ -248,6 +266,20 @@ class Wrapper:
             for typ in ccfg.types:
                 casters[typ] = cfg
 
+    def _update_addl_data_files(self) -> List[str]:
+        headers = set()
+        for ccfg in self.cfg.type_casters:
+            headers.add(ccfg.header)
+
+        if headers:
+            includes = self.get_include_dirs()
+            if includes:
+                for hdr in headers:
+                    for p in includes:
+                        fpath = join(p, hdr)
+                        if exists(fpath):
+                            self._add_addl_data_file(fpath)
+
     def all_deps(self):
         if self._all_deps is None:
             self._all_deps = self.pkgcfg.get_all_deps(self.name)
@@ -256,10 +288,15 @@ class Wrapper:
     def _all_includes(self, include_rpyb):
         includes = self.get_include_dirs()
         for dep in self.all_deps():
-            includes.extend(dep.get_include_dirs())
+            dep_inc = dep.get_include_dirs()
+            if dep_inc:
+                includes.extend(dep_inc)
         if include_rpyb:
             includes.extend(self.pkgcfg.get_pkg("robotpy-build").get_include_dirs())
         return includes
+
+    def _generation_search_path(self):
+        return [self.root] + self._all_includes(False)
 
     def _all_library_dirs(self):
         libs = self.get_library_dirs()
@@ -311,7 +348,6 @@ class Wrapper:
         return casters
 
     def on_build_dl(self, cache: str, srcdir: str):
-
         pkgcfgpy = join(self.root, "pkgcfg.py")
         srcdir = join(srcdir, self.name)
 
@@ -326,12 +362,15 @@ class Wrapper:
             pass
 
         libnames_full = []
+        all_libs = []
         downloads = self.cfg.download
         if downloads:
-            libnames_full = self._clean_and_download(downloads, cache, srcdir)
+            libnames_full, all_libs = self._clean_and_download(downloads, cache, srcdir)
 
         self._write_libinit_py(libnames_full)
         self._write_pkgcfg_py(pkgcfgpy, libnames_full)
+
+        return all_libs
 
     def _apply_patches(self, patches: List[PatchInfo], root: str):
         import patch
@@ -348,8 +387,7 @@ class Wrapper:
 
     def _clean_and_download(
         self, downloads: List[Download], cache: str, srcdir: str
-    ) -> List[str]:
-
+    ) -> Tuple[List[str], List[str]]:
         libdir = join(self.root, "lib")
         incdir = join(self.root, "include")
 
@@ -363,6 +401,7 @@ class Wrapper:
 
         dlopen_libnames = self.get_dlopen_library_names()
         libnames_full = []
+        all_libs = []
 
         for dl in downloads:
             # extract the whole thing into a directory when using for sources
@@ -407,6 +446,7 @@ class Wrapper:
                     posixpath.join(dl.libdir, libname): join(libdir, libname)
                     for libname in extract_names
                 }
+                all_libs.extend(to.values())
             else:
                 to = {}
 
@@ -421,16 +461,15 @@ class Wrapper:
 
         if add_incdir:
             for f in glob.glob(join(glob.escape(incdir), "**"), recursive=True):
-                self._add_generated_file(f)
+                self._add_addl_data_file(f)
 
         if add_libdir:
             for f in glob.glob(join(glob.escape(libdir), "**"), recursive=True):
-                self._add_generated_file(f)
+                self._add_addl_data_file(f)
 
-        return libnames_full
+        return libnames_full, all_libs
 
     def _write_libinit_py(self, libnames):
-
         # This file exists to ensure that any shared library dependencies
         # are loaded for the compiled extension
 
@@ -451,13 +490,18 @@ class Wrapper:
         init += "\n"
 
         if libnames:
-            init += "from ctypes import cdll\n\n"
+            if self.platform.os == "osx":
+                init += "from ctypes import CDLL, RTLD_GLOBAL\n\n"
+            else:
+                init += "from ctypes import cdll\n\n"
 
             for libname in libnames:
                 init += "try:\n"
-                init += (
-                    f'    _lib = cdll.LoadLibrary(join(_root, "lib", "{libname}"))\n'
-                )
+                if self.platform.os == "osx":
+                    init += f'    _lib = CDLL(join(_root, "lib", "{libname}"), mode=RTLD_GLOBAL)\n'
+                else:
+                    init += f'    _lib = cdll.LoadLibrary(join(_root, "lib", "{libname}"))\n'
+
                 init += "except FileNotFoundError:\n"
                 init += f'    if not exists(join(_root, "lib", "{libname}")):\n'
                 init += f'        raise FileNotFoundError("{libname} was not found on your system. Is this package correctly installed?")\n'
@@ -481,10 +525,9 @@ class Wrapper:
         with open(self.libinit_import_py, "w") as fp:
             fp.write(init)
 
-        self._add_generated_file(self.libinit_import_py)
+        self._add_addl_data_file(self.libinit_import_py)
 
     def _write_pkgcfg_py(self, fname, libnames_full):
-
         library_dirs = "[]"
         library_dirs_rel = []
         library_names = self.get_library_names()
@@ -562,21 +605,11 @@ class Wrapper:
         with open(fname, "w") as fp:
             fp.write(pkgcfg)
 
-        self._add_generated_file(fname)
-
-    def _load_generation_data(self, datafile):
-        with open(datafile) as fp:
-            data = yaml.safe_load(fp)
-
-        if data is None:
-            data = {}
-
-        return HooksDataYaml(**data)
+        self._add_addl_data_file(fname)
 
     def on_build_gen(
         self, cxx_gen_dir, missing_reporter: Optional[MissingReporter] = None
     ):
-
         if not self.cfg.autogen_headers:
             return
 
@@ -588,20 +621,13 @@ class Wrapper:
             report_only = False
             missing_reporter = MissingReporter()
 
-        thisdir = abspath(dirname(__file__))
-
         hppoutdir = join(self.rpy_incdir, "rpygen")
-        tmpl_dir = join(thisdir, "templates")
-        cpp_tmpl = join(tmpl_dir, "cls.cpp.j2")
-        hpp_tmpl = join(tmpl_dir, "cls_rpy_include.hpp.j2")
-        classdeps_tmpl = join(tmpl_dir, "clsdeps.json.j2")
 
-        pp_includes = self._all_includes(False)
+        pp_includes = self._all_includes(True) + [sysconfig.get_path("include")]
 
         # TODO: only regenerate files if the generated files
         #       have changed
         if not report_only:
-
             if self.dev_config.only_generate is None:
                 shutil.rmtree(cxx_gen_dir, ignore_errors=True)
                 shutil.rmtree(hppoutdir, ignore_errors=True)
@@ -615,9 +641,9 @@ class Wrapper:
             datapath = join(self.setup_root, normpath(self.cfg.generation_data))
             per_header = isdir(datapath)
             if not per_header:
-                data = self._load_generation_data(datapath)
+                data = AutowrapConfigYaml.from_file(datapath)
         else:
-            data = HooksDataYaml()
+            data = AutowrapConfigYaml()
 
         pp_defines = [self._cpp_version] + self.platform.defines + self.cfg.pp_defines
         casters = self._all_casters()
@@ -625,21 +651,19 @@ class Wrapper:
         # These are written to file to make it easier for dev mode to work
         classdeps = {}
 
-        processor = ConfigProcessor(tmpl_dir)
-
         if self.dev_config.only_generate is not None:
             only_generate = {n: True for n in self.dev_config.only_generate}
         else:
             only_generate = None
 
-        generation_search_path = [self.root] + self._all_includes(False)
+        generation_search_path = self._generation_search_path()
 
         for name, header in self.cfg.autogen_headers.items():
-
             header = normpath(header)
             for path in generation_search_path:
                 header_path = join(path, header)
                 if exists(header_path):
+                    header_root = pathlib.Path(path)
                     break
             else:
                 import pprint
@@ -647,61 +671,53 @@ class Wrapper:
                 pprint.pprint(generation_search_path)
                 raise ValueError("could not find " + header)
 
-            if report_only:
-                templates = []
-                class_templates = []
-            else:
-                cpp_dst = join(cxx_gen_dir, f"{name}.cpp")
-                self.extension.sources.append(cpp_dst)
+            if not report_only:
                 classdeps_dst = join(cxx_gen_dir, f"{name}.json")
                 classdeps[name] = classdeps_dst
-
-                hpp_dst = join(
-                    hppoutdir,
-                    "{{ cls['namespace'] | replace(':', '_') }}__{{ cls['name'] }}.hpp",
-                )
-
-                templates = [
-                    {"src": cpp_tmpl, "dst": cpp_dst},
-                    {"src": classdeps_tmpl, "dst": classdeps_dst},
-                ]
-                class_templates = [{"src": hpp_tmpl, "dst": hpp_dst}]
-
-            if only_generate is not None and not only_generate.pop(name, False):
-                continue
 
             if per_header:
                 data_fname = join(datapath, name + ".yml")
                 if not exists(data_fname):
                     print("WARNING: could not find", data_fname)
-                    data = HooksDataYaml()
+                    data = AutowrapConfigYaml()
                 else:
-                    data = self._load_generation_data(data_fname)
+                    data = AutowrapConfigYaml.from_file(data_fname)
 
-            # for each thing, create a h2w configuration dictionary
-            cfgd = {
-                # generation code depends on this being just one header!
-                "headers": [header_path],
-                "templates": templates,
-                "class_templates": class_templates,
-                "preprocess": True,
-                "pp_retain_all_content": False,
-                "pp_include_paths": pp_includes,
-                "pp_defines": pp_defines,
-                "vars": {"mod_fn": name},
-            }
+            if only_generate is not None and not only_generate.pop(name, False):
+                continue
 
-            cfg = Config(cfgd)
-            cfg.validate()
-            cfg.root = self.incdir
+            popts = ParserOptions(
+                preprocessor=make_preprocessor(
+                    defines=pp_defines,
+                    include_paths=pp_includes,
+                    encoding=data.encoding,
+                )
+            )
 
-            hooks = Hooks(data, casters, report_only)
+            gendata = GeneratorData(data)
+
             try:
-                processor.process_config(cfg, data, hooks)
+                hctx = parse_header(
+                    name,
+                    pathlib.Path(header_path),
+                    header_root,
+                    gendata,
+                    popts,
+                    casters,
+                    report_only,
+                )
+
+                if not report_only:
+                    generated_sources = self.wwriter.write_files(
+                        hctx, name, cxx_gen_dir, hppoutdir, classdeps_dst
+                    )
+                    self.extension.sources.extend(
+                        [relpath(src, self.setup_root) for src in generated_sources]
+                    )
             except Exception as e:
                 raise ValueError(f"processing {header}") from e
 
-            hooks.report_missing(data_fname, missing_reporter)
+            gendata.report_missing(data_fname, missing_reporter)
 
         if only_generate:
             unused = ", ".join(sorted(only_generate))
@@ -723,7 +739,7 @@ class Wrapper:
         self._gen_includes = gen_includes
 
         for f in glob.glob(join(glob.escape(hppoutdir), "*.hpp")):
-            self._add_generated_file(f)
+            self._add_addl_data_file(f)
 
     def finalize_extension(self):
         if self.extension is None:
@@ -743,16 +759,9 @@ class Wrapper:
         self.extension.extra_objects = self._all_extra_objects()
 
     def _write_wrapper_hpp(self, outdir, classdeps):
-
         decls = []
         begin_calls = []
         finish_calls = []
-
-        def _clean(n):
-            tmpl_idx = n.find("<")
-            if tmpl_idx != -1:
-                n = n[:tmpl_idx]
-            return n
 
         # Need to ensure that wrapper initialization is called in base order
         # so we have to toposort it here. The data is written at gen time
@@ -770,11 +779,10 @@ class Wrapper:
                 ordering.append(name)
 
             for clsname, bases in dep.items():
-                clsname = _clean(clsname)
                 if clsname in types2name:
-                    raise ValueError(f"duplicate class {clsname}")
+                    raise ValueError(f"{name} ({jsonfile}): duplicate class {clsname}")
                 types2name[clsname] = name
-                types2deps[clsname] = [_clean(base) for base in bases]
+                types2deps[clsname] = bases[:]
 
         to_sort: Dict[str, Set[str]] = {}
         for clsname, bases in types2deps.items():

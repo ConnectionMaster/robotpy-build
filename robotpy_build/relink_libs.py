@@ -25,7 +25,6 @@
 
 """
 
-
 from delocate.delocating import filter_system_libs
 from delocate.tools import get_install_names, set_install_name as _set_install_name
 
@@ -107,8 +106,7 @@ def _resolve_dependencies(
 
 
 def _fix_libs(to_fix: LibsDict, libs: LibsDict):
-
-    for (current_libpath, install_libpath) in to_fix.values():
+    for current_libpath, install_libpath in to_fix.values():
         for lib in get_install_names(current_libpath):
             libb = path.basename(lib)
             libdata = libs.get(libb)
@@ -165,4 +163,15 @@ def relink_extension(
         )
     }
     _fix_libs(to_fix, libs)
+    return libs
+
+
+def resolve_libs(
+    install_root: str,
+    pkg: PkgCfg,
+    pkgcfg: PkgCfgProvider,
+):
+    libs: LibsDict = {}
+    _resolve_dependencies(install_root, pkg, pkgcfg, libs)
+    _resolve_libs_in_self(pkg, install_root, libs)
     return libs

@@ -12,12 +12,17 @@ int fnRenamedParam(int x) { return x; }
 
 // class
 struct OriginalClass {
+    // constructor
+    OriginalClass() = default;
+    explicit OriginalClass(int prop) : originalProp(prop) {};
 
     // class function
     int fnOriginal() { return 0x2; }
 
     // class function parameter
     int fnRenamedParam(int x) { return x; }
+
+    int fnAutoRenamed(int from) { return from; }
 
     int getProp() { return originalProp; }
     void setProp(int p) { originalProp = p; }

@@ -1,13 +1,14 @@
 from rpytest import ft
+import pytest
 
 
 def test_enums():
-
     # normal enums convert to integers
     assert ft.GEnum.GE1 == 1
     assert ft.NSGEnum.NSGE2 == 2
     assert ft.EnumContainer.InnerEnum.IE1 == 1
     assert ft.NSEnumContainer.InnerEnum.NSIE1 == 1
+    assert ft.NSEnumContainer2.InnerEnumContainer.MoreInnerEnum.NSIEMIE1 == 1
 
     # Unnamed enums are hoisted as integers to their scope
     # - not supported yet for globals
@@ -20,6 +21,9 @@ def test_enums():
     assert "NSGE2" in ft.NSGCEnum.NSGE2.__members__
     assert "IEC1" in ft.EnumContainer.InnerCEnum.__members__
     assert "NSIEC1" in ft.NSEnumContainer.InnerCEnum.__members__
+    assert (
+        "NSIEMIEC1" in ft.NSEnumContainer2.InnerEnumContainer.MoreInnerCEnum.__members__
+    )
 
 
 def test_enum_strip_prefix():
@@ -27,3 +31,12 @@ def test_enum_strip_prefix():
     assert ft.StripPrefixEnum.STRIP_1 == 1
     # STRIP_B is converted to B
     assert ft.StripPrefixEnum.B == 2
+
+
+def test_enum_math():
+    assert ft.GEnumMath.MGE1 & 1 == 1
+    assert ft.EnumContainer2.InnerMathEnum.IME1 & 1 == 1
+
+    # Normal enums don't support math
+    with pytest.raises(TypeError):
+        ft.EnumContainer.InnerEnum.IE1 & 1

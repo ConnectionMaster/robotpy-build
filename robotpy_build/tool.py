@@ -1,12 +1,16 @@
 import argparse
+import fnmatch
 import glob
 import inspect
-from os.path import basename, dirname, exists, join, relpath, splitext
-from pathlib import PurePosixPath
+from itertools import chain
+from os.path import basename, dirname, exists, join, relpath
+from pathlib import Path, PurePosixPath
 import posixpath
 import pprint
 import subprocess
 import sys
+import types
+import typing
 import re
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
@@ -16,7 +20,7 @@ import tomli_w
 from contextlib import suppress
 
 from .setup import Setup
-from .generator_data import MissingReporter
+from .autowrap.generator_data import MissingReporter
 from .command.util import get_build_temp_path
 
 from . import overrides
@@ -26,11 +30,6 @@ from . import platforms
 def get_setup() -> Setup:
     s = Setup()
     s.prepare()
-
-    temp_path = join(get_build_temp_path(), "dlstatic")
-    for static_lib in s.static_libs:
-        static_lib.set_root(temp_path)
-
     return s
 
 
@@ -41,6 +40,12 @@ class BuildDep:
             "build-dep", help="Install build dependencies", parents=[parent_parser]
         )
         parser.add_argument("--install", help="Actually do it", action="store_true")
+        parser.add_argument(
+            "--pre",
+            action="store_true",
+            default=False,
+            help="Include pre-release and development versions.",
+        )
         parser.add_argument("--find-links", help="Find links arg", default=None)
         return parser
 
@@ -57,6 +62,8 @@ class BuildDep:
             "--disable-pip-version-check",
             "install",
         ]
+        if args.pre:
+            pipargs.append("--pre")
         if args.find_links:
             pipargs.extend(
                 [
@@ -89,7 +96,6 @@ class GenCreator:
         return parser
 
     def run(self, args):
-
         pfx = ""
         if args.strip_prefixes:
             pfx = "strip_prefixes:\n- " + "\n- ".join(args.strip_prefixes) + "\n\n"
@@ -127,39 +133,80 @@ class HeaderScanner:
             help="Generate a list of headers in TOML form",
             parents=[parent_parser],
         )
+        parser.add_argument("--all", default=False, action="store_true")
         return parser
 
     def run(self, args):
         s = get_setup()
-        for wrapper in s.wrappers + s.static_libs:
-            print(
-                f'[tool.robotpy-build.wrappers."{wrapper.package_name}".autogen_headers]'
-            )
 
+        to_ignore = s.project.scan_headers_ignore
+
+        def _should_ignore(f):
+            for pat in to_ignore:
+                if fnmatch.fnmatch(f, pat):
+                    return True
+            return False
+
+        already_present = {}
+        if not args.all:
+            for i, wrapper in enumerate(s.project.wrappers.values()):
+                files = set()
+                if wrapper.autogen_headers:
+                    files |= {Path(f) for f in wrapper.autogen_headers.values()}
+                if wrapper.type_casters:
+                    files |= {Path(tc.header) for tc in wrapper.type_casters}
+                if not files:
+                    continue
+                for incdir in s.wrappers[i]._generation_search_path():
+                    ifiles = already_present.setdefault(incdir, set())
+                    incdir = Path(incdir)
+                    for f in files:
+                        if (incdir / f).exists():
+                            ifiles.add(f)
+
+        for wrapper in s.wrappers:
+            printed = False
+
+            # This uses the direct include directories instead of the generation
+            # search path as we only want to output a file once
             for incdir in wrapper.get_include_dirs():
+                wpresent = already_present.get(incdir, set())
+
                 files = list(
                     sorted(
-                        relpath(f, incdir)
-                        for f in glob.glob(join(incdir, "**", "*.h"), recursive=True)
+                        Path(relpath(f, incdir))
+                        for f in chain(
+                            glob.glob(join(incdir, "**", "*.h"), recursive=True),
+                            glob.glob(join(incdir, "**", "*.hpp"), recursive=True),
+                        )
+                        if "rpygen" not in f and not _should_ignore(relpath(f, incdir))
                     )
                 )
 
+                files = [f for f in files if f not in wpresent]
+                if not files:
+                    continue
+
+                if not printed:
+                    print(
+                        f'[tool.robotpy-build.wrappers."{wrapper.package_name}".autogen_headers]'
+                    )
+                    printed = True
+
                 lastdir = None
                 for f in files:
-                    if "rpygen" not in f:
-                        thisdir = dirname(f)
-                        if lastdir is None:
-                            if thisdir:
-                                print("#", PurePosixPath(thisdir))
-                        elif lastdir != thisdir:
-                            print()
-                            if thisdir:
-                                print("#", PurePosixPath(thisdir))
-                        lastdir = thisdir
+                    thisdir = f.parent
+                    if lastdir is None:
+                        if thisdir:
+                            print("#", thisdir)
+                    elif lastdir != thisdir:
+                        print()
+                        if thisdir:
+                            print("#", thisdir)
+                    lastdir = thisdir
 
-                        base = splitext(basename(f))[0]
-                        f = PurePosixPath(f)
-                        print(f'{base} = "{f}"')
+                    base = f.stem
+                    print(f'{base} = "{f.as_posix()}"')
                 print()
 
 
@@ -173,6 +220,9 @@ class ImportCreator:
         )
         parser.add_argument("base", help="Ex: wpiutil")
         parser.add_argument("compiled", nargs="?", help="Ex: wpiutil._impl.wpiutil")
+        parser.add_argument(
+            "--write", "-w", action="store_true", help="Modify existing __init__.py"
+        )
         return parser
 
     def _rel(self, base: str, compiled: str) -> str:
@@ -183,6 +233,9 @@ class ImportCreator:
         return f".{'.'.join(elems)}"
 
     def run(self, args):
+        self.create(args.base, args.compiled, args.write)
+
+    def create(self, base: str, compiled: typing.Optional[str], write: bool):
         # Runtime Dependency Check
         try:
             import black
@@ -190,33 +243,67 @@ class ImportCreator:
             print("Error, The following module is required to run this tool: black")
             exit(1)
 
-        compiled = args.compiled
         if not compiled:
-            compiled = f"{args.base}._{args.base.split('.')[-1]}"
+            compiled = f"{base}._{base.split('.')[-1]}"
 
         # TODO: could probably generate this from parsed code, but seems hard
         ctx = {}
         exec(f"from {compiled} import *", {}, ctx)
+        for k in list(ctx.keys()):
+            if isinstance(ctx[k], types.ModuleType):
+                del ctx[k]
 
-        relimport = self._rel(args.base, compiled)
+        relimport = self._rel(base, compiled)
 
-        stmt_compiled = "" if not args.compiled else f" {args.compiled}"
+        stmt_compiled = "" if not compiled else f" {compiled}"
+        begin_stmt = f"# autogenerated by 'robotpy-build create-imports {base}"
 
         stmt = inspect.cleandoc(
             f"""
 
-            # autogenerated by 'robotpy-build create-imports {args.base}{stmt_compiled}'
+            {begin_stmt}{stmt_compiled}'
             from {relimport} import {','.join(sorted(ctx.keys()))}
             __all__ = ["{'", "'.join(sorted(ctx.keys()))}"]
         
         """
         )
 
-        print(
-            subprocess.check_output(
-                ["black", "-", "-q"], input=stmt.encode("utf-8")
-            ).decode("utf-8")
-        )
+        content = subprocess.check_output(
+            ["black", "-", "-q"], input=stmt.encode("utf-8")
+        ).decode("utf-8")
+
+        if write:
+            fctx = {}
+            exec(f"from {base} import __file__", {}, fctx)
+            fname = fctx["__file__"]
+
+            with open(fname) as fp:
+                fcontent = orig_content = fp.read()
+
+            # Find the beginning statement
+            idx = startidx = fcontent.find(begin_stmt)
+            if startidx != -1:
+                for to_find in ("from", "__all__", "[", "]", "\n"):
+                    idx = fcontent.find(to_find, idx)
+                    if idx == -1:
+                        startidx = -1
+                        break
+
+            if startidx == -1:
+                # If not present, just append and let the user figure it out
+                fcontent = fcontent + "\n" + content
+            else:
+                fcontent = fcontent[:startidx] + content + fcontent[idx + 1 :]
+
+            if fcontent != orig_content:
+                with open(fname, "w") as fp:
+                    fp.write(fcontent)
+                print("MOD", base)
+            else:
+                print("OK", base)
+
+        else:
+            print(content)
 
 
 class PlatformInfo:
@@ -232,12 +319,10 @@ class PlatformInfo:
         return parser
 
     def run(self, args):
-
         if args.list:
             for name in platforms.get_platform_names():
                 print(name)
         else:
-
             p = platforms.get_platform(args.platform)
             print("platform:")
             pprint.pprint(p)
@@ -265,7 +350,6 @@ class ShowOverrides:
         return parser
 
     def run(self, args):
-
         p = platforms.get_platform(args.platform)
         override_keys = platforms.get_platform_override_keys(p)
 
@@ -277,7 +361,6 @@ class ShowOverrides:
 
 
 class MavenParser:
-
     after_archs = [
         "static",
         "debug",
@@ -310,7 +393,6 @@ class MavenParser:
         return False
 
     def run(self, args):
-
         self.os_names = set()
         self.arch_names = set()
         for plat in platforms._platforms.values():
@@ -341,7 +423,6 @@ class MavenParser:
                 exit()
 
             for w_name, wrapper in {**wrappers, **static_libs}.items():
-
                 if "maven_lib_download" not in wrapper:
                     continue
 
@@ -360,7 +441,6 @@ class MavenParser:
                 source_name = None
 
                 if args.brute_force:
-
                     for os in self.os_names:
                         for arch in self.arch_names:
                             for after_arch in self.after_archs + [""]:
@@ -444,7 +524,6 @@ class MavenParser:
 
 
 def main():
-
     parser = argparse.ArgumentParser(prog="robotpy-build")
     parent_parser = argparse.ArgumentParser(add_help=False)
     subparsers = parser.add_subparsers(dest="cmd")
@@ -474,8 +553,8 @@ def main():
     else:
         retval = 0
 
-    exit(retval)
+    return retval
 
 
 if __name__ == "__main__":
-    main()
+    exit(main())
