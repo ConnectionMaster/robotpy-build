@@ -34,13 +34,14 @@ X86_64 = "x86-64"
 
 # key is python platform, value is information about wpilib maven artifacts
 _platforms = {
-    "linux-athena": WPILibMavenPlatform("athena", defines=["__FRC_ROBORIO__"]),
-    "linux-raspbian": WPILibMavenPlatform("raspbian", defines=["__RASPBIAN__"]),
+    "linux-roborio": WPILibMavenPlatform("athena", defines=["__FRC_ROBORIO__"]),
+    "linux-raspbian": WPILibMavenPlatform("arm32", defines=["__RASPBIAN__"]),
+    "linux-armv7l": WPILibMavenPlatform("arm32"),
     "linux-x86_64": WPILibMavenPlatform(X86_64),
-    "linux-aarch64": WPILibMavenPlatform("aarch64bionic"),
+    "linux-aarch64": WPILibMavenPlatform("arm64"),
     "win32": WPILibMavenPlatform("x86", "windows", "", ".dll", ".lib", ".lib"),
     "win-amd64": WPILibMavenPlatform(X86_64, "windows", "", ".dll", ".lib", ".lib"),
-    "macos-x86_64": WPILibMavenPlatform(X86_64, "osx", libext=".dylib"),
+    "macos-universal": WPILibMavenPlatform("universal", "osx", libext=".dylib"),
 }
 
 
@@ -58,12 +59,17 @@ def get_platform(name: typing.Optional[str] = None) -> WPILibMavenPlatform:
     #       be useful to note for the future.
 
     if not name:
-
         pyplatform = _get_platform()
 
         # Check for 64 bit x86 macOS (version agnostic)
-        if re.fullmatch(r"macosx-.*-x86_64", pyplatform):
-            return _platforms["macos-x86_64"]
+        # - See https://github.com/pypa/setuptools/issues/2520 for universal2
+        #   related questions? Sorta.
+        if (
+            re.fullmatch(r"macosx-.*-x86_64", pyplatform)
+            or re.fullmatch(r"macosx-.*-arm64", pyplatform)
+            or re.fullmatch(r"macosx-.*-universal2", pyplatform)
+        ):
+            return _platforms["macos-universal"]
 
         if pyplatform == "linux-armv7l":
             try:
@@ -71,11 +77,20 @@ def get_platform(name: typing.Optional[str] = None) -> WPILibMavenPlatform:
 
                 distro_id = distro.id()
 
-                if distro_id == "nilrt":
-                    pyplatform = "linux-athena"
-                elif distro_id == "raspbian":
+                if distro_id == "raspbian":
                     pyplatform = "linux-raspbian"
 
+            except Exception:
+                pass
+
+        elif pyplatform == "linux-armv6":
+            try:
+                import distro
+
+                distro_id = distro.id()
+
+                if distro_id == "raspbian":
+                    pyplatform = "linux-raspbian"
             except Exception:
                 pass
 

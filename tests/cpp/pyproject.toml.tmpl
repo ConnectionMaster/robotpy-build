@@ -36,29 +36,45 @@ depends = ["rpytest_tc"]
 
 sources = [
     "rpytest/ft/src/fields.cpp",
-    "rpytest/ft/src/ft.cpp"
+    "rpytest/ft/src/ft.cpp",
+    "rpytest/ft/src/using2.cpp",
 ]
 
 generation_data = "gen/ft"
 generate = [
     { abstract = "abstract.h" },
+    { base_qualname = "base_qualname.h" },
+    { base_qualname_hidden = "base_qualname_hidden.h" },
+    { buffers = "buffers.h" },
     { custom_type_caster = "custom_type_caster.h" },
     { defaults = "defaults.h" },
     { docstrings = "docstrings.h" },
     { docstrings_append = "docstrings_append.h" },
     { enums = "enums.h" },
+    { factory = "factory.h" },
     { fields = "fields.h" },
+    { gilsafe_container = "gilsafe_container.h" },
     { keepalive = "keepalive.h" },
     { ignore = "ignore.h" },
+    { ignored_by_default = "ignored_by_default.h" },
+    { inline_code = "inline_code.h" },
     { lifetime = "lifetime.h" },
+    { nested = "nested.h" },
+    { ns_class = "ns_class.h" },
+    { ns_hidden = "ns_hidden.h" },
+    { operators = "operators.h" },
     { overloads = "overloads.h" },
     { parameters = "parameters.h" },
+    { refqual = "refqual.h" },
     { rename = "rename.h" },
+    { retval = "retval.h" },
     { subpkg = "subpkg.h" },
     { static_only = "static_only.h" },
     { trampoline = "trampoline.h" },
     { type_caster = "type_caster.h" },
     { type_caster_nested = "type_caster_nested.h" },
+    { using = "using.h" },
+    { using2 = "using2.h" },
     { virtual_comma = "virtual_comma.h" },
     { virtual_xform = "virtual_xform.h" },
 
@@ -69,6 +85,7 @@ generate = [
     { IGChild = "inheritance/igchild.h" },
     { Overloaded = "inheritance/overloaded.h" },
     { mvi = "inheritance/mvi.h" },
+    { usingparent = "inheritance/usingparent.h" },
 
     # Protection
     { PBase = "protection/pbase.h" },
@@ -81,9 +98,14 @@ generate = [
     {tcrtpfwd = "templates/tcrtpfwd.h"},
     {tconcrete = "templates/tconcrete.h"},
 
+    {tvbase = "templates/tvbase.h"},
+    {tvchild = "templates/tvchild.h"},
+
     {tbasic = "templates/basic.h"},
+    {tdependent_base = "templates/dependent_base.h"},
     {tdependent_param = "templates/dependent_param.h"},
     {tdependent_using = "templates/dependent_using.h"},
+    {tdependent_using2 = "templates/dependent_using2.h"},
     {tfn = "templates/fn.h" },
     {tnumeric = "templates/numeric.h"},
     {tnested = "templates/nested.h"},

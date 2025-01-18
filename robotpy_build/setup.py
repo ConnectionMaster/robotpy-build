@@ -15,6 +15,7 @@ try:
 except ImportError:
     bdist_wheel = None  # type: ignore
 
+from .autowrap.writer import WrapperWriter
 
 from .command.build_py import BuildPy
 from .command.build_dl import BuildDl
@@ -22,10 +23,17 @@ from .command.build_gen import BuildGen
 from .command.build_ext import BuildExt
 from .command.build_pyi import BuildPyi
 from .command.develop import Develop
+from .command.update_init import UpdateInit
+
+try:
+    from .command.editable_wheel import EditableWheel
+except ImportError:
+    EditableWheel = None  # type: ignore
+
+from .config.pyproject_toml import RobotpyBuildConfig
 
 from .maven import convert_maven_to_downloads
 from .overrides import apply_overrides
-from .pyproject_configs import RobotpyBuildConfig
 from .pkgcfg_provider import PkgCfgProvider
 from .platforms import get_platform, get_platform_override_keys
 from .static_libs import StaticLib
@@ -86,6 +94,9 @@ class Setup:
                 wrapper.autogen_headers = autogen_headers
                 wrapper.generate = None
 
+        # Shared wrapper writer instance
+        self.wwriter = WrapperWriter()
+
     @property
     def base_package(self):
         return self.project.base_package
@@ -103,20 +114,33 @@ class Setup:
         return self.setup_kwargs["name"]
 
     def prepare(self):
-
         self.setup_kwargs = self.project_dict.get("metadata", {})
         self.setup_kwargs["zip_safe"] = False
         self.setup_kwargs["include_package_data"] = True
-        self.setup_kwargs["python_requires"] = ">=3.6"
+        self.setup_kwargs["python_requires"] = ">=3.8"
 
         self._generate_long_description()
 
         # get_version expects the directory to exist
         base_package_path = self.base_package_path
         os.makedirs(base_package_path, exist_ok=True)
-        self.setup_kwargs["version"] = get_version(
-            write_to=join(base_package_path, "version.py"), fallback_version="master"
+        this_version = get_version(
+            write_to=join(base_package_path, "version.py"),
+            fallback_version="master",
+            search_parent_directories=True,
         )
+        self.setup_kwargs["version"] = this_version
+
+        # Support ==THIS_VERSION
+        install_requires = self.setup_kwargs.get("install_requires")
+        if install_requires:
+
+            def _xform(v: str):
+                if v.endswith("==THIS_VERSION"):
+                    v = f"{v[:-14]}=={this_version}"
+                return v
+
+            self.setup_kwargs["install_requires"] = list(map(_xform, install_requires))
 
         self.pkgcfg = PkgCfgProvider()
 
@@ -132,7 +156,10 @@ class Setup:
             "build_ext": BuildExt,
             "build_pyi": BuildPyi,
             "develop": Develop,
+            "update_init": UpdateInit,
         }
+        if EditableWheel:
+            self.setup_kwargs["cmdclass"]["editable_wheel"] = EditableWheel
         if bdist_wheel:
             self.setup_kwargs["cmdclass"]["bdist_wheel"] = bdist_wheel
         for cls in self.setup_kwargs["cmdclass"].values():
@@ -140,6 +167,7 @@ class Setup:
             cls.static_libs = self.static_libs
             cls.rpybuild_pkgcfg = self.pkgcfg
         BuildPyi.base_package = self.base_package
+        UpdateInit.update_list = self.project.update_init
 
         # We already know some of our packages, so collect those in addition
         # to using find_packages()
@@ -161,14 +189,13 @@ class Setup:
                 self.setup_kwargs["long_description"] = fp.read()
 
     def _collect_wrappers(self):
-
         ext_modules = []
 
         for package_name, cfg in self.project.wrappers.items():
             if cfg.ignore:
                 continue
             self._fix_downloads(cfg, False)
-            w = Wrapper(package_name, cfg, self)
+            w = Wrapper(package_name, cfg, self, self.wwriter)
             self.wrappers.append(w)
             self.pkgcfg.add_pkg(w)
 

@@ -26,6 +26,9 @@ struct DocClass
     /** An awesome variable, use it for something */
     int sweet_var;
 
+    /** this is a bitfield */
+    int bitfield: 1;
+
   /**
    * Construct a Ramsete unicycle controller.
    *
@@ -36,4 +39,22 @@ struct DocClass
    *             values provide more damping in response.
    */
     void utf8_docstring() {}
+
+    /**
+     * @brief Function with parameter that's a python keyword
+     * 
+     * @param from The from parameter
+     */
+    void fn2(int from) {}
+
+    /**
+     * @brief Function with renamed parameter
+     * 
+     * @param renamed The renamed parameter
+     */
+    void fn3(int renamed) {}
 };
+
+/// This function returns something very important
+[[nodiscard]]
+int important_retval() { return 42; }

@@ -15,6 +15,11 @@ def test_dependent_using():
     assert du.getThird([1, 2, 3]) == 3
 
 
+def test_dependent_using2():
+    du = ft.TDependentUsing2Int()
+    assert du.getThird([1, 2, 3]) == 3
+
+
 def test_classwithfn():
     assert ft.TClassWithFn.getT(1) == 1
     assert ft.TClassWithFn.getT(False) is False
@@ -57,3 +62,19 @@ def test_crtp_concrete():
     assert c.concrete() == 32
     assert c.baseFn() == 42
     assert c.get() == "TCrtp"
+
+
+#
+# Template base weirdness
+#
+
+
+def test_tvbase2():
+    p = ft.TVParam2()
+    assert p.get() == 2
+
+    b = ft.TVBase2()
+    assert b.get(p) == "TVBase 2"
+
+    c = ft.TVChild2()
+    assert c.get(p) == "TVChild 2"
